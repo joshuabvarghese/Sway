@@ -217,7 +217,7 @@ docker run --rm sway:latest --simulate --cycles 3
 docker run -v $(pwd)/config.json:/config.json sway:latest --config /config.json --dry-run
 ```
 
----
+--
 
 ## What Was Fixed
 
