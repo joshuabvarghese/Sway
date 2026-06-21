@@ -251,7 +251,7 @@ Usage: rebalancer [flags]
   --cycles int       Number of simulation cycles (default: 3, --simulate only)
 ```
 
---
+---
 
 ## Extending the engine
 
