@@ -14,6 +14,12 @@ import (
 	"github.com/project-sway/sway/internal/opensearch"
 )
 
+const banner = `
+=================================================================
+  Project Sway — OpenSearch Cluster Rebalancing Engine
+  Cloud-Agnostic  |  Safety-First  |  Incremental by Design
+=================================================================`
+
 // Engine orchestrates the full rebalancing lifecycle:
 //
 //	CollectSnapshot → CircuitBreaker.Evaluate → Generate → Execute
@@ -55,6 +61,7 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 
 // Run executes rebalancing cycles continuously until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
+	fmt.Println(banner)
 	for {
 		if err := e.runCycle(ctx); err != nil {
 			e.logger.Printf("[ENGINE] Cycle error: %v", err)
@@ -97,7 +104,7 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("generating target state: %w", err)
 	}
-	e.printTargetState(target)
+	e.printTargetState(target, snap)
 
 	if len(target.Moves) == 0 {
 		fmt.Println("[REBALANCER] Cluster is already within acceptable skew bounds. No moves required.")
@@ -147,7 +154,7 @@ func (e *Engine) executeMoves(ctx context.Context, moves []ShardMove) error {
 
 		resp, err := e.client.Reroute(ctx, req, e.cfg.Rebalancer.DryRun)
 		if err != nil {
-			fmt.Printf("%s Move %d FAILED — %s: %v  (%s → %s)\n",
+			fmt.Printf("%s Move %d FAILED — %s: %v → %s → %s\n",
 				prefix, i+1, label, err, m.FromName, m.ToName)
 			continue
 		}
@@ -232,7 +239,7 @@ func (e *Engine) printBreakerResult(r *circuitbreaker.Result) {
 	}
 }
 
-func (e *Engine) printTargetState(t *TargetState) {
+func (e *Engine) printTargetState(t *TargetState, snap *agent.ClusterSnapshot) {
 	fmt.Printf("  Current Skew  : %.4f\n", t.CurrentSkew)
 	fmt.Printf("  Target Skew   : %.4f  (%.0f%% reduction target)\n",
 		t.CurrentSkew*(1.0-e.cfg.Rebalancer.SkewReductionTarget),
@@ -269,13 +276,13 @@ func humanBytes(b int64) string {
 	if b == 0 {
 		return "unknown"
 	}
-	const gib = 1 << 30
-	const mib = 1 << 20
-	if b >= gib {
-		return fmt.Sprintf("%.2f GiB", float64(b)/float64(gib))
+	const gb = 1 << 30
+	const mb = 1 << 20
+	if b >= gb {
+		return fmt.Sprintf("%.2f GiB", float64(b)/float64(gb))
 	}
-	if b >= mib {
-		return fmt.Sprintf("%.0f MiB", float64(b)/float64(mib))
+	if b >= mb {
+		return fmt.Sprintf("%.0f MiB", float64(b)/float64(mb))
 	}
 	return fmt.Sprintf("%d B", b)
 }

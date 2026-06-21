@@ -66,12 +66,11 @@ func main() {
 		cfg.Rebalancer.MaxMovesPerCycle = 4
 		cfg.Rebalancer.SkewReductionTarget = 0.25
 		cfg.Rebalancer.LargeShardThresholdBytes = 5 * 1024 * 1024 * 1024 // 5 GiB
-		// Simulation latency is synthetic; set a generous threshold.
-		cfg.CircuitBreaker.MaxAvgLatencyMs = 200.0
 	} else {
 		var err error
 		cfg, err = config.LoadFromFile(*configPath)
 		if err != nil {
+			// If config file not found, use defaults and warn.
 			if os.IsNotExist(err) {
 				logger.Printf("Config file %q not found, using defaults.", *configPath)
 				cfg = config.Default()
@@ -87,8 +86,8 @@ func main() {
 	}
 
 	// ── OpenSearch client ────────────────────────────────────────────────────
-	// Cloud-agnosticism lives here: the same engine runs regardless of which
-	// Client implementation is plugged in.
+	// This is where cloud-agnosticism lives: the same engine runs regardless
+	// of what Client implementation is plugged in.
 	var client opensearch.Client
 	if *simulate {
 		sim := simulation.New(logger)
@@ -99,12 +98,11 @@ func main() {
 			logger.Fatal("No OpenSearch addresses configured.")
 		}
 		client = opensearch.NewHTTPClient(
-			cfg.OpenSearch.Addresses,
+			cfg.OpenSearch.Addresses[0],
 			cfg.OpenSearch.Username,
 			cfg.OpenSearch.Password,
 			cfg.OpenSearch.TLSVerify,
 			time.Duration(cfg.OpenSearch.TimeoutSeconds)*time.Second,
-			cfg.OpenSearch.MaxRetries,
 		)
 	}
 
@@ -118,7 +116,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// ── Banner ───────────────────────────────────────────────────────────────
+	// ── Run ──────────────────────────────────────────────────────────────────
 	fmt.Printf("\n=================================================================\n")
 	fmt.Printf("  Project Sway — OpenSearch Cluster Rebalancing Engine\n")
 	fmt.Printf("  Cloud-Agnostic  |  Safety-First  |  Incremental by Design\n")
@@ -131,7 +129,6 @@ func main() {
 	}
 	fmt.Printf("=================================================================\n")
 
-	// ── Run ──────────────────────────────────────────────────────────────────
 	if *simulate {
 		runSimulation(ctx, engine, *cycles, cfg.Agent.PollInterval())
 		return

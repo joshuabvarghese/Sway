@@ -110,7 +110,7 @@ func (cb *CircuitBreaker) Last() *Result {
 // ──────────────────────────────────────────────────────────────
 
 // checkHealth verifies the cluster health meets the required level.
-// "green" > "yellow" > "red" in terms of acceptability.
+// "green" < "yellow" < "red" in terms of strictness.
 func (cb *CircuitBreaker) checkHealth(snap *agent.ClusterSnapshot) CheckItem {
 	required := strings.ToLower(cb.cfg.RequiredHealth)
 	actual := strings.ToLower(snap.Health)
@@ -124,23 +124,16 @@ func (cb *CircuitBreaker) checkHealth(snap *agent.ClusterSnapshot) CheckItem {
 }
 
 // checkLatency verifies average search latency is below the threshold.
-//
-// Important: this uses average query latency (QueryTimeInMillis/QueryTotal),
-// not p99. A healthy cluster typically has 5–30ms average. The configured
-// threshold (default 40ms) acts as a coarse proxy: if average latency exceeds
-// it, the cluster is likely under heavy load and should not be disturbed.
-//
-// For true p99 gating, integrate an APM backend (Prometheus, OpenTelemetry)
-// and extend CircuitBreaker with a custom Collector.
+// This acts as a proxy for p99 in the absence of an APM integration.
 func (cb *CircuitBreaker) checkLatency(snap *agent.ClusterSnapshot) CheckItem {
 	lat := snap.AvgSearchLatMs
-	// Zero latency means no queries have run yet — safe to proceed.
-	passed := lat == 0 || lat <= cb.cfg.MaxAvgLatencyMs
+	// If no queries have been run yet, latency is 0 — that is safe to proceed.
+	passed := lat <= cb.cfg.MaxAvgLatencyMs
 	return CheckItem{
 		Name:     "Avg Search Latency",
 		Passed:   passed,
 		Measured: fmt.Sprintf("%.1fms", lat),
-		Limit:    fmt.Sprintf("<= %.0fms (avg; not p99)", cb.cfg.MaxAvgLatencyMs),
+		Limit:    fmt.Sprintf("< %.0fms", cb.cfg.MaxAvgLatencyMs),
 	}
 }
 

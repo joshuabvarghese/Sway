@@ -21,8 +21,7 @@ import (
 // The SimulatedClient (internal/simulation) satisfies the same interface.
 //
 // Cloud-specific auth (AWS SigV4, GCP workload identity) is handled by
-// supplying a custom http.RoundTripper to NewHTTPClient via WithTransport —
-// no interface changes required.
+// supplying a custom http.RoundTripper to NewHTTPClient — no interface changes.
 type Client interface {
 	GetNodesStats(ctx context.Context) (*NodesStatsResponse, error)
 	GetClusterState(ctx context.Context) (*ClusterStateResponse, error)
@@ -36,14 +35,11 @@ type Client interface {
 // ──────────────────────────────────────────────────────────────
 
 // HTTPClient talks directly to the OpenSearch REST API.
-// It is stateless and safe for concurrent use. Multiple addresses are tried in
-// round-robin order on each request; failed addresses trigger a retry on the
-// next one up to MaxRetries total attempts.
+// It is stateless and safe for concurrent use.
 type HTTPClient struct {
-	addresses  []string
+	baseURL    string
 	username   string
 	password   string
-	maxRetries int
 	httpClient *http.Client
 }
 
@@ -59,19 +55,14 @@ func WithTransport(rt http.RoundTripper) HTTPClientOption {
 }
 
 // NewHTTPClient constructs an HTTPClient from connection parameters.
-// All provided addresses are tried in order on retries.
-func NewHTTPClient(addresses []string, username, password string, tlsVerify bool, timeout time.Duration, maxRetries int, opts ...HTTPClientOption) *HTTPClient {
-	if maxRetries < 1 {
-		maxRetries = 1
-	}
+func NewHTTPClient(address, username, password string, tlsVerify bool, timeout time.Duration, opts ...HTTPClientOption) *HTTPClient {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: !tlsVerify}, //nolint:gosec
 	}
 	c := &HTTPClient{
-		addresses:  addresses,
-		username:   username,
-		password:   password,
-		maxRetries: maxRetries,
+		baseURL:  address,
+		username: username,
+		password: password,
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: tr,
@@ -83,44 +74,11 @@ func NewHTTPClient(addresses []string, username, password string, tlsVerify bool
 	return c
 }
 
-// get performs a GET request with retry/failover across all addresses.
+// get performs a GET request and decodes JSON into v.
 func (c *HTTPClient) get(ctx context.Context, path string, v interface{}) error {
-	return c.doWithRetry(ctx, http.MethodGet, path, nil, v)
-}
-
-// post performs a POST request with retry/failover across all addresses.
-func (c *HTTPClient) post(ctx context.Context, path string, body interface{}, v interface{}) error {
-	b, err := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return fmt.Errorf("marshalling body: %w", err)
-	}
-	return c.doWithRetry(ctx, http.MethodPost, path, b, v)
-}
-
-// doWithRetry tries each address in round-robin for up to maxRetries total
-// attempts, returning the last error if all fail.
-func (c *HTTPClient) doWithRetry(ctx context.Context, method, path string, body []byte, v interface{}) error {
-	var lastErr error
-	total := len(c.addresses) * c.maxRetries
-	for attempt := 0; attempt < total; attempt++ {
-		addr := c.addresses[attempt%len(c.addresses)]
-		lastErr = c.doOnce(ctx, method, addr+path, body, v)
-		if lastErr == nil {
-			return nil
-		}
-	}
-	return lastErr
-}
-
-// doOnce performs a single HTTP request to the given full URL.
-func (c *HTTPClient) doOnce(ctx context.Context, method, url string, body []byte, v interface{}) error {
-	var reqBody io.Reader
-	if body != nil {
-		reqBody = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
-	if err != nil {
-		return fmt.Errorf("building request for %s: %w", url, err)
+		return fmt.Errorf("building request for %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.username != "" {
@@ -128,12 +86,38 @@ func (c *HTTPClient) doOnce(ctx context.Context, method, url string, body []byte
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, url, err)
+		return fmt.Errorf("GET %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s %s returned %d: %s", method, url, resp.StatusCode, b)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GET %s returned %d: %s", path, resp.StatusCode, body)
+	}
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// post performs a POST request with a JSON body and decodes the response.
+func (c *HTTPClient) post(ctx context.Context, path string, body interface{}, v interface{}) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshalling body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("building request for %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body2, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("POST %s returned %d: %s", path, resp.StatusCode, body2)
 	}
 	return json.NewDecoder(resp.Body).Decode(v)
 }
@@ -158,9 +142,6 @@ func (c *HTTPClient) GetClusterHealth(ctx context.Context) (*ClusterHealthRespon
 
 // GetShardSizes calls GET /_cat/shards?format=json&bytes=b and returns a map
 // keyed by "index/shardNum/p|r" → size in bytes.
-//
-// The key format uses lowercase "p" and "r" as returned by the cat API.
-// This matches the key format used by agent.ShardInfo.ShardKey().
 func (c *HTTPClient) GetShardSizes(ctx context.Context) (map[string]int64, error) {
 	var rows []CatShard
 	if err := c.get(ctx, "/_cat/shards?format=json&bytes=b&h=index,shard,prirep,store,node,state", &rows); err != nil {
@@ -171,7 +152,6 @@ func (c *HTTPClient) GetShardSizes(ctx context.Context) (map[string]int64, error
 		if row.State != "STARTED" {
 			continue
 		}
-		// prirep is "p" or "r" — lowercase, matching ShardInfo.ShardKey().
 		size, _ := strconv.ParseInt(row.Store, 10, 64)
 		key := fmt.Sprintf("%s/%s/%s", row.Index, row.Shard, row.Prirep)
 		out[key] = size
@@ -180,8 +160,8 @@ func (c *HTTPClient) GetShardSizes(ctx context.Context) (map[string]int64, error
 }
 
 // Reroute calls POST /_cluster/reroute.
-// When dryRun is true the call is skipped entirely and a synthetic acknowledged
-// response is returned — the engine still logs the full planned payload.
+// When dryRun is true the call is skipped and a synthetic acknowledged response
+// is returned — the engine still logs the full payload.
 func (c *HTTPClient) Reroute(ctx context.Context, req *RerouteRequest, dryRun bool) (*RerouteResponse, error) {
 	if dryRun {
 		return &RerouteResponse{Acknowledged: true}, nil

@@ -1,18 +1,14 @@
 // Package agent contains the monitoring agent and its metric types.
 package agent
 
-import (
-	"fmt"
-	"strconv"
-	"time"
-)
+import "time"
 
 // NodeMetrics holds the computed, normalised metrics for one cluster node.
 type NodeMetrics struct {
-	NodeID     string
-	NodeName   string
-	Host       string
-	Roles      []string
+	NodeID   string
+	NodeName string
+	Host     string
+	Roles    []string
 	IsDataNode bool
 
 	// Raw resource readings.
@@ -23,13 +19,10 @@ type NodeMetrics struct {
 	ShardCount      int
 	TotalShardBytes int64
 
-	// Derived latency (average from cumulative node stats).
-	// NOTE: This is NOT p99. It is the mean query time derived from
-	// QueryTimeInMillis/QueryTotal from /_nodes/stats. Typical healthy values
-	// are 5–30ms average. For true p99, integrate an APM backend.
+	// Derived latency (average from node stats; see CircuitBreaker note in config).
 	AvgSearchLatMs float64
 
-	// Weighted hot-score: JVMWeight*(heap/100) + DiskWeight*(disk/100) + ShardWeight*(count/max).
+	// Weighted hot-score: JVMWeight*heap + DiskWeight*disk + ShardWeight*shardFraction.
 	HotScore float64
 	// IsHot is true when HotScore >= AgentConfig.HotNodeThreshold.
 	IsHot bool
@@ -45,15 +38,28 @@ type ShardInfo struct {
 	SizeBytes int64  // from _cat/shards; 0 if unavailable
 }
 
-// ShardKey returns a stable string key for this exact shard copy (index/num/role).
-// The format "index/N/p" or "index/N/r" matches the key emitted by
-// HTTPClient.GetShardSizes, ensuring size lookups always succeed.
+// ShardKey returns a stable string key for this shard's identity (not placement).
+// Used to detect when a replica already lives on a proposed destination node.
 func (s *ShardInfo) ShardKey() string {
 	role := "r"
 	if s.Primary {
 		role = "p"
 	}
-	return fmt.Sprintf("%s/%s/%s", s.Index, strconv.Itoa(s.ShardNum), role)
+	return s.Index + "/" + itoa(s.ShardNum) + "/" + role
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	buf := [20]byte{}
+	pos := len(buf)
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[pos:])
 }
 
 // ClusterSnapshot is a point-in-time view of the whole cluster,

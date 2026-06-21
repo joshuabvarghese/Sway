@@ -40,19 +40,11 @@ type projectedNode struct {
 	jvmHeapPercent  float64
 	diskUsedPercent float64
 	diskTotalBytes  int64
-	// totalShardBytes tracks shard data bytes only (no OS/translog overhead).
-	// diskUsedPercent is derived from this plus a fixed overhead factor so that
-	// projections stay consistent with how the agent computes disk usage.
-	totalShardBytes int64
 	shardCount      int
-	// shardKeys tracks which shards (and shard groups) live here to prevent
-	// primary+replica co-location on the same node.
+	totalShardBytes int64
+	// shardKeys tracks which shards live here (to prevent duplicates).
 	shardKeys map[string]bool
 }
-
-// diskOverheadFactor accounts for OS files, translog, and segment overhead.
-// The simulation uses 10%; we apply the same factor here for consistency.
-const diskOverheadFactor = 1.10
 
 func (p *projectedNode) hotScore(cfg config.AgentConfig, maxShards int) float64 {
 	jvm := p.jvmHeapPercent / 100.0
@@ -70,22 +62,15 @@ func (p *projectedNode) hotScore(cfg config.AgentConfig, maxShards int) float64 
 //
 // Algorithm:
 //  1. Build a mutable "projected" copy of the cluster state.
-//  2. Capture maxShards once (before any moves) to keep skew scores on a
-//     consistent scale throughout the planning loop.
-//  3. Identify hot nodes (HotScore >= threshold).
-//  4. Sort hot-node shards by size descending ("large shards first").
+//  2. Identify hot nodes (HotScore >= threshold).
+//  3. Sort hot-node shards by size descending ("large shards first").
 //     Moving large shards maximises disk-pressure relief per API call.
-//  5. For each candidate shard, find the coolest eligible target node:
-//     - Must not already host any copy of the same shard (primary or replica).
-//     - Must not exceed disk capacity (90% threshold) after the move.
-//  6. Apply the move to the projected state and recalculate skew.
-//  7. Stop when projected skew reduction >= target, or MaxMovesPerCycle reached.
-//
-// Projection accuracy note:
-// JVM heap is approximated as decreasing by 3% per shard lost and increasing
-// by 3% per shard gained. This is intentionally conservative — real heap
-// pressure depends on Lucene segment count and field data, not raw byte size.
-// The projection is directionally correct but should not be treated as exact.
+//  4. For each candidate shard, find the coolest eligible target node:
+//     - Must be a data node.
+//     - Must not already host a copy of the same shard (primary or replica).
+//     - Must not exceed disk capacity after the move.
+//  5. Apply the move to the projected state and recalculate skew.
+//  6. Stop when projected skew reduction >= target, or MaxMovesPerCycle is reached.
 type TargetStateGenerator struct {
 	agentCfg config.AgentConfig
 	rebCfg   config.RebalancerConfig
@@ -104,17 +89,10 @@ func (g *TargetStateGenerator) Generate(snap *agent.ClusterSnapshot) (*TargetSta
 
 	// Build projected nodes.
 	projected := g.buildProjected(snap)
-
-	// Capture maxShards once before any moves so that all hot-score calculations
-	// within this planning pass use the same denominator. Without this, early
-	// moves can change maxShards, shifting the score scale mid-loop and making
-	// the SkewReduction percentage inconsistent.
-	maxShards := maxProjectedShards(projected)
-
-	initialSkew := computeProjectedSkewFixed(projected, g.agentCfg, maxShards)
+	initialSkew := computeProjectedSkew(projected, g.agentCfg)
 
 	// Collect candidate moves: shards on hot nodes, sorted by size desc.
-	candidates := g.candidateShards(snap, projected, maxShards)
+	candidates := g.candidateShards(snap, projected)
 
 	var moves []ShardMove
 	currentSkew := initialSkew
@@ -136,7 +114,7 @@ func (g *TargetStateGenerator) Generate(snap *agent.ClusterSnapshot) (*TargetSta
 			continue
 		}
 		// Find the best (coolest) target node.
-		target := g.findTarget(shard, projected, maxShards)
+		target := g.findTarget(shard, projected)
 		if target == nil {
 			continue
 		}
@@ -144,17 +122,17 @@ func (g *TargetStateGenerator) Generate(snap *agent.ClusterSnapshot) (*TargetSta
 		// Apply move to projected state.
 		g.applyMove(shard, fromNode, target)
 
-		// Recalculate skew using the fixed maxShards baseline.
-		currentSkew = computeProjectedSkewFixed(projected, g.agentCfg, maxShards)
+		// Recalculate skew with updated state.
+		currentSkew = computeProjectedSkew(projected, g.agentCfg)
 
 		role := "REPLICA"
 		if shard.Primary {
 			role = "PRIMARY"
 		}
 		rationale := fmt.Sprintf("%.2f→%.2f hot-score; %s shard (%.1f GiB)",
-			fromNode.hotScore(g.agentCfg, maxShards),
-			target.hotScore(g.agentCfg, maxShards),
-			role, float64(shard.SizeBytes)/float64(1<<30))
+			fromNode.hotScore(g.agentCfg, maxProjectedShards(projected)),
+			target.hotScore(g.agentCfg, maxProjectedShards(projected)),
+			role, float64(shard.SizeBytes)/1e9)
 
 		moves = append(moves, ShardMove{
 			Shard:     shard,
@@ -197,12 +175,14 @@ func (g *TargetStateGenerator) buildProjected(snap *agent.ClusterSnapshot) map[s
 			jvmHeapPercent:  nm.JVMHeapPercent,
 			diskUsedPercent: nm.DiskUsedPercent,
 			diskTotalBytes:  nm.DiskTotalBytes,
-			totalShardBytes: nm.TotalShardBytes,
 			shardCount:      nm.ShardCount,
+			totalShardBytes: nm.TotalShardBytes,
 			shardKeys:       make(map[string]bool),
 		}
 		// Track which shards already live on this node.
 		for _, s := range snap.ShardsOnNode(id) {
+			// Record both the exact key and the "index/shardNum" group key
+			// so we can block primary+replica co-location.
 			p.shardKeys[s.ShardKey()] = true
 			p.shardKeys[groupKey(s)] = true
 		}
@@ -214,10 +194,10 @@ func (g *TargetStateGenerator) buildProjected(snap *agent.ClusterSnapshot) map[s
 // candidateShards returns shards on hot nodes, sorted by size descending.
 // Large shards are moved first: they provide the greatest pressure relief
 // per shard movement and reduce skew most efficiently.
-func (g *TargetStateGenerator) candidateShards(snap *agent.ClusterSnapshot, projected map[string]*projectedNode, maxShards int) []agent.ShardInfo {
+func (g *TargetStateGenerator) candidateShards(snap *agent.ClusterSnapshot, projected map[string]*projectedNode) []agent.ShardInfo {
 	hotNodeIDs := make(map[string]bool)
 	for id, p := range projected {
-		if p.hotScore(g.agentCfg, maxShards) >= g.agentCfg.HotNodeThreshold {
+		if p.hotScore(g.agentCfg, maxProjectedShards(projected)) >= g.agentCfg.HotNodeThreshold {
 			hotNodeIDs[id] = true
 		}
 	}
@@ -246,19 +226,16 @@ func (g *TargetStateGenerator) candidateShards(snap *agent.ClusterSnapshot, proj
 }
 
 // findTarget selects the coolest eligible target node for a shard.
-func (g *TargetStateGenerator) findTarget(shard agent.ShardInfo, projected map[string]*projectedNode, maxShards int) *projectedNode {
+func (g *TargetStateGenerator) findTarget(shard agent.ShardInfo, projected map[string]*projectedNode) *projectedNode {
+	maxShards := maxProjectedShards(projected)
+
 	// Sort candidates by hot-score ascending (coolest first).
 	nodes := make([]*projectedNode, 0, len(projected))
 	for _, p := range projected {
 		nodes = append(nodes, p)
 	}
 	sort.Slice(nodes, func(i, j int) bool {
-		si := nodes[i].hotScore(g.agentCfg, maxShards)
-		sj := nodes[j].hotScore(g.agentCfg, maxShards)
-		if si != sj {
-			return si < sj
-		}
-		return nodes[i].nodeID < nodes[j].nodeID // deterministic tie-break
+		return nodes[i].hotScore(g.agentCfg, maxShards) < nodes[j].hotScore(g.agentCfg, maxShards)
 	})
 
 	for _, target := range nodes {
@@ -266,17 +243,14 @@ func (g *TargetStateGenerator) findTarget(shard agent.ShardInfo, projected map[s
 		if target.nodeID == shard.NodeID {
 			continue
 		}
-		// Any copy of this shard (primary or replica) must not already be on this node.
+		// Shard (any role) must not already be on this node.
 		if target.shardKeys[groupKey(shard)] {
 			continue
 		}
-		// Disk capacity check: destination must have room after the move.
-		// We account for the same overhead factor the agent uses so the projection
-		// matches observed disk usage.
+		// Basic disk capacity check: destination must have room.
 		if target.diskTotalBytes > 0 {
-			projectedShardBytes := target.totalShardBytes + shard.SizeBytes
-			projectedDiskBytes := int64(float64(projectedShardBytes) * diskOverheadFactor)
-			projectedPct := float64(projectedDiskBytes) / float64(target.diskTotalBytes) * 100.0
+			projectedUsed := target.totalShardBytes + shard.SizeBytes
+			projectedPct := float64(projectedUsed) / float64(target.diskTotalBytes) * 100.0
 			if projectedPct >= 90.0 {
 				continue
 			}
@@ -288,36 +262,31 @@ func (g *TargetStateGenerator) findTarget(shard agent.ShardInfo, projected map[s
 
 // applyMove updates projected state to reflect a planned move.
 func (g *TargetStateGenerator) applyMove(shard agent.ShardInfo, from, to *projectedNode) {
-	// ── Source node ──────────────────────────────────────────────────────────
+	// Remove from source.
 	from.shardCount--
 	from.totalShardBytes -= shard.SizeBytes
 	if from.diskTotalBytes > 0 {
-		usedBytes := int64(float64(from.totalShardBytes) * diskOverheadFactor)
-		from.diskUsedPercent = float64(usedBytes) / float64(from.diskTotalBytes) * 100.0
+		from.diskUsedPercent = float64(from.totalShardBytes) / float64(from.diskTotalBytes) * 100.0
+		// JVM heap roughly tracks data volume; apply a proportional decrease.
+		from.jvmHeapPercent = math.Max(5.0, from.jvmHeapPercent*0.97)
 	}
-	// JVM heap decreases as the node sheds data. The 3% multiplier is a
-	// conservative approximation; actual relief depends on GC and segment merges.
-	from.jvmHeapPercent = math.Max(5.0, from.jvmHeapPercent*0.97)
 	delete(from.shardKeys, shard.ShardKey())
 	delete(from.shardKeys, groupKey(shard))
 
-	// ── Destination node ─────────────────────────────────────────────────────
+	// Add to destination.
 	to.shardCount++
 	to.totalShardBytes += shard.SizeBytes
 	if to.diskTotalBytes > 0 {
-		usedBytes := int64(float64(to.totalShardBytes) * diskOverheadFactor)
-		to.diskUsedPercent = float64(usedBytes) / float64(to.diskTotalBytes) * 100.0
+		to.diskUsedPercent = float64(to.totalShardBytes) / float64(to.diskTotalBytes) * 100.0
+		to.jvmHeapPercent = math.Min(95.0, to.jvmHeapPercent*1.03)
 	}
-	to.jvmHeapPercent = math.Min(95.0, to.jvmHeapPercent*1.03)
 	to.shardKeys[shard.ShardKey()] = true
 	to.shardKeys[groupKey(shard)] = true
 }
 
-// computeProjectedSkewFixed returns the population std-dev of projected
-// hot-scores using a fixed maxShards value. Using a fixed baseline ensures
-// all skew measurements within a single Generate() call are on the same scale,
-// making the reported SkewReduction percentage meaningful.
-func computeProjectedSkewFixed(projected map[string]*projectedNode, cfg config.AgentConfig, maxShards int) float64 {
+// computeProjectedSkew returns the population std-dev of projected hot-scores.
+func computeProjectedSkew(projected map[string]*projectedNode, cfg config.AgentConfig) float64 {
+	maxShards := maxProjectedShards(projected)
 	scores := make([]float64, 0, len(projected))
 	for _, p := range projected {
 		scores = append(scores, p.hotScore(cfg, maxShards))
@@ -340,7 +309,7 @@ func computeProjectedSkewFixed(projected map[string]*projectedNode, cfg config.A
 
 // maxProjectedShards returns the maximum shard count across all projected nodes.
 func maxProjectedShards(projected map[string]*projectedNode) int {
-	max := 1 // avoid div-by-zero
+	max := 1
 	for _, p := range projected {
 		if p.shardCount > max {
 			max = p.shardCount

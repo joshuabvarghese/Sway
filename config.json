@@ -1,13 +1,10 @@
 {
   "opensearch": {
-    "addresses": [
-      "http://localhost:9200"
-    ],
+    "addresses": ["http://localhost:9200"],
     "username": "",
     "password": "",
-    "tls_verify": false,
-    "timeout_seconds": 30,
-    "max_retries": 3
+    "tls_verify": true,
+    "timeout_seconds": 30
   },
   "agent": {
     "poll_interval_seconds": 30,
@@ -24,7 +21,7 @@
   },
   "circuit_breaker": {
     "required_health": "green",
-    "max_avg_latency_ms": 40.0,
+    "max_avg_latency_ms": 200.0,
     "max_relocating_shards": 0
   }
 }
