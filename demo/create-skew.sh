@@ -1,36 +1,49 @@
 #!/bin/bash
-# Forces real imbalance: dumps a lot of documents into a single index with
-# zero replicas and only 1 shard, then forcibly allocates it to one node.
-# This gives Sway (and your dashboard) a visible disk/shard skew to fix.
+# Forces a strong, visible imbalance by directly rerouting existing shards
+# onto opensearch-node1, rather than relying on disk usage differences
+# (which are invisible at this small data scale on a local test cluster).
 
 HOST="http://localhost:9200"
 
-echo "Creating a heavy index pinned to opensearch-node1..."
-curl -s -X PUT "$HOST/heavy-2024" -H 'Content-Type: application/json' -d '{
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "index.routing.allocation.require._name": "opensearch-node1"
-  }
-}' > /dev/null
+echo "Fetching current shard layout..."
+curl -s "$HOST/_cat/shards?format=json" > /tmp/sway-shards.json
 
-echo "Bulk loading documents (this takes a minute)..."
-for batch in $(seq 1 20); do
-  PAYLOAD=""
-  for i in $(seq 1 500); do
-    PAYLOAD="$PAYLOAD{\"index\":{\"_index\":\"heavy-2024\"}}
-{\"msg\":\"padding document with extra text to take up more disk space on purpose $i $batch\",\"level\":\"info\",\"batch\":$batch}
-"
-  done
-  curl -s -X POST "$HOST/_bulk" -H 'Content-Type: application/x-ndjson' -d "$PAYLOAD" > /dev/null
-  echo "  batch $batch/20 done"
-done
+python3 << PYEOF
+import json, subprocess
+
+with open('/tmp/sway-shards.json') as f:
+    shards = json.load(f)
+
+moves = [s for s in shards if s.get('node') and s.get('node') != 'opensearch-node1' and s.get('prirep') == 'p']
+moves = moves[:10]
+
+if not moves:
+    print('No eligible shards found to move.')
+else:
+    commands = [{
+        'move': {
+            'index': s['index'],
+            'shard': int(s['shard']),
+            'from_node': s['node'],
+            'to_node': 'opensearch-node1'
+        }
+    } for s in moves]
+
+    body = json.dumps({'commands': commands})
+    print(f'Rerouting {len(commands)} shard(s) onto opensearch-node1...')
+
+    result = subprocess.run(
+        ['curl', '-s', '-X', 'POST', 'http://localhost:9200/_cluster/reroute',
+         '-H', 'Content-Type: application/json', '-d', body],
+        capture_output=True, text=True
+    )
+    print(result.stdout[:800])
+PYEOF
 
 echo ""
-echo "Skew created. Check it with:"
-echo "  curl -s '$HOST/_cat/allocation?v'"
+echo "Waiting for relocation to finish..."
+sleep 8
+curl -s "$HOST/_cat/allocation?v"
 echo ""
-echo "node1 should now show noticeably more shards/disk than node2 and node3."
-echo "Now run Sway:"
-echo "  ./sway-mac --config config.json --dry-run --once"
-echo "and watch your sway-metrics dashboard for the spike, then the rebalance."
+echo "Now re-run Sway:"
+echo "  ../sway-mac --config ../config.json --dry-run --once"

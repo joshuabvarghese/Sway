@@ -8,13 +8,13 @@
   },
   "agent": {
     "poll_interval_seconds": 30,
-    "hot_node_threshold": 0.70,
+    "hot_node_threshold": 0.30,
     "jvm_weight": 0.40,
     "disk_weight": 0.40,
     "shard_weight": 0.20
   },
   "rebalancer": {
-    "dry_run": true,
+    "dry_run": false,
     "max_moves_per_cycle": 5,
     "skew_reduction_target": 0.25,
     "large_shard_threshold_bytes": 2147483648
